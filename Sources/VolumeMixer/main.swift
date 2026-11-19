@@ -429,65 +429,71 @@ struct MixerPopover: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             if model.apps.isEmpty {
                 Image(systemName: "speaker.wave.2")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 44)
             } else {
-                ScrollView {
-                    VStack(spacing: 5) {
-                        ForEach(model.apps) { app in
-                                VStack(spacing: 6) {
-                                    HStack(spacing: 10) {
-                                        Button { model.toggleMute(for: app) } label: {
-                                            Image(nsImage: app.icon)
-                                                .resizable()
-                                                .aspectRatio(contentMode: .fit)
-                                                .frame(width: 25, height: 25)
-                                                .overlay(alignment: .bottomTrailing) {
-                                                    if model.volumes[app.id, default: 1] == 0 {
-                                                        Image(systemName: "speaker.slash.fill")
-                                                            .font(.system(size: 8, weight: .bold))
-                                                            .padding(2)
-                                                            .background(.regularMaterial, in: Circle())
-                                                    }
-                                                }
+                VStack(spacing: 4) {
+                    ForEach(model.apps) { app in
+                        VStack(spacing: 2) {
+                            HStack(spacing: 9) {
+                                Button { model.toggleMute(for: app) } label: {
+                                    Image(nsImage: app.icon)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(width: 23, height: 23)
+                                        .overlay(alignment: .bottomTrailing) {
+                                            if model.volumes[app.id, default: 1] == 0 {
+                                                Image(systemName: "speaker.slash.fill")
+                                                    .font(.system(size: 8, weight: .bold))
+                                                    .padding(2)
+                                                    .background(.regularMaterial, in: Circle())
+                                            }
                                         }
-                                        .buttonStyle(.plain)
-                                        .help("Mute or unmute \(app.name)")
-
-                                        Text(app.name)
-                                            .font(.system(size: 13, weight: .medium))
-                                            .lineLimit(1)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                                        Text(volumeLabel(for: app))
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundStyle(.secondary)
-                                            .frame(width: 34, alignment: .trailing)
-                                    }
-
-                                    Slider(
-                                        value: Binding(
-                                            get: { model.volumes[app.id, default: 1] },
-                                            set: { model.setVolume($0, for: app) }
-                                        ),
-                                        in: 0...1
-                                    )
-                                    .tint(.primary.opacity(0.8))
                                 }
-                                .padding(.horizontal, 11)
-                                .padding(.vertical, 8)
-                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                                .buttonStyle(.plain)
+                                .help("Mute or unmute \(app.name)")
+
+                                Text(app.name)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                Text(volumeLabel(for: app))
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 34, alignment: .trailing)
+                            }
+
+                            Slider(
+                                value: Binding(
+                                    get: { model.volumes[app.id, default: 1] },
+                                    set: { model.setVolume($0, for: app) }
+                                ),
+                                in: 0...1
+                            )
+                            .tint(.primary.opacity(0.85))
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                .strokeBorder(.white.opacity(0.13), lineWidth: 0.7)
                         }
                     }
                 }
-                .frame(maxHeight: 300)
             }
         }
         .padding(10)
-        .frame(width: 310)
+        .frame(width: 315)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
+        }
         .alert("Couldn't adjust volume", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
