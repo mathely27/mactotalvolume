@@ -120,7 +120,7 @@ enum AudioProcessMonitor {
 }
 
 /// Captures one app's output through a Core Audio process tap, applies gain,
-/// and sends it back to the current output device through AVAudioEngine.
+/// and sends it back through an aggregate device containing the current output.
 final class AppVolumeTap {
     private var tapID: AudioObjectID = kAudioObjectUnknown
     private var aggregateDeviceID: AudioObjectID = kAudioObjectUnknown
@@ -138,7 +138,12 @@ final class AppVolumeTap {
 
         do {
             let tapUID = try Self.tapUID(tapID)
+            let outputUID = try Self.defaultOutputDeviceUID()
             let aggregateUID = "com.mathely.mactotalvolume.tap.\(UUID().uuidString)"
+            let outputEntry: [String: Any] = [
+                kAudioSubDeviceUIDKey as String: outputUID,
+                kAudioSubDeviceDriftCompensationKey as String: false
+            ]
             let tapEntry: [String: Any] = [
                 kAudioSubTapUIDKey as String: tapUID,
                 kAudioSubTapDriftCompensationKey as String: true
@@ -148,6 +153,8 @@ final class AppVolumeTap {
                 kAudioAggregateDeviceUIDKey as String: aggregateUID,
                 kAudioAggregateDeviceIsPrivateKey as String: true,
                 kAudioAggregateDeviceIsStackedKey as String: false,
+                kAudioAggregateDeviceSubDeviceListKey as String: [outputEntry],
+                kAudioAggregateDeviceMainSubDeviceKey as String: outputUID,
                 kAudioAggregateDeviceTapListKey as String: [tapEntry],
                 kAudioAggregateDeviceTapAutoStartKey as String: true
             ]
@@ -159,22 +166,19 @@ final class AppVolumeTap {
             guard aggregateStatus == noErr else { throw MixerError.coreAudio(aggregateStatus) }
             aggregateDeviceID = aggregateID
 
-            guard let inputUnit = engine.inputNode.audioUnit else {
-                throw MixerError.message("macOS did not provide an audio input unit.")
-            }
-            var selectedDevice = aggregateID
-            let inputStatus = AudioUnitSetProperty(
-                inputUnit,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global,
-                0,
-                &selectedDevice,
-                UInt32(MemoryLayout<AudioObjectID>.size)
-            )
-            guard inputStatus == noErr else { throw MixerError.coreAudio(inputStatus) }
+            try Self.selectDevice(aggregateID, for: engine.inputNode.audioUnit,
+                                  message: "macOS did not provide an audio input unit.")
+            try Self.selectDevice(aggregateID, for: engine.outputNode.audioUnit,
+                                  message: "macOS did not provide an audio output unit.")
 
             let input = engine.inputNode
-            engine.connect(input, to: engine.mainMixerNode, format: input.outputFormat(forBus: 0))
+            let inputFormat = input.outputFormat(forBus: 0)
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                throw MixerError.message(
+                    "The audio tap has no active input format. Start app audio and try again."
+                )
+            }
+            engine.connect(input, to: engine.mainMixerNode, format: inputFormat)
             engine.mainMixerNode.outputVolume = min(max(gain, 0), 1)
             engine.prepare()
             try engine.start()
@@ -211,6 +215,47 @@ final class AppVolumeTap {
         let status = AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &uid)
         guard status == noErr, let uid else { throw MixerError.coreAudio(status) }
         return uid as String
+    }
+
+    private static func defaultOutputDeviceUID() throws -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+        )
+        guard status == noErr, deviceID != kAudioObjectUnknown else {
+            throw MixerError.coreAudio(status)
+        }
+
+        address.mSelector = kAudioDevicePropertyDeviceUID
+        var uid: CFString = "" as CFString
+        size = UInt32(MemoryLayout<CFString>.stride)
+        let uidStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &uid)
+        guard uidStatus == noErr else { throw MixerError.coreAudio(uidStatus) }
+        return uid as String
+    }
+
+    private static func selectDevice(
+        _ deviceID: AudioObjectID,
+        for audioUnit: AudioUnit?,
+        message: String
+    ) throws {
+        guard let audioUnit else { throw MixerError.message(message) }
+        var selectedDevice = deviceID
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &selectedDevice,
+            UInt32(MemoryLayout<AudioObjectID>.size)
+        )
+        guard status == noErr else { throw MixerError.coreAudio(status) }
     }
 }
 
