@@ -456,9 +456,11 @@ struct MixerPopover: View {
                 .padding(.horizontal, 8)
 
             if model.apps.isEmpty {
-                Image(systemName: "speaker.wave.2.fill")
+                Label("Play audio to show app controls", systemImage: "speaker.wave.2.fill")
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                    .padding(.horizontal, 9)
             } else {
                 VStack(spacing: 9) {
                     ForEach(model.apps) { app in
@@ -520,19 +522,6 @@ struct MixerPopover: View {
         }
         .padding(17)
         .frame(width: 370)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 32, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 32, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [.white.opacity(0.55), .white.opacity(0.12), .white.opacity(0.35)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
-        }
-        .shadow(color: .black.opacity(0.28), radius: 24, x: 0, y: 12)
         .alert("Couldn't adjust volume", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
