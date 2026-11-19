@@ -94,6 +94,29 @@ enum AudioProcessMonitor {
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    static func defaultOutputName() -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+        ) == noErr, deviceID != kAudioObjectUnknown else {
+            return "Mac Speakers"
+        }
+
+        address.mSelector = kAudioObjectPropertyName
+        var name: CFString = "Mac Speakers" as CFString
+        size = UInt32(MemoryLayout<CFString>.stride)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name) == noErr else {
+            return "Mac Speakers"
+        }
+        return name as String
+    }
+
     private static func readBundleID(_ objectID: AudioObjectID) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioProcessPropertyBundleID,
@@ -355,6 +378,7 @@ enum MixerError: LocalizedError {
 @MainActor
 final class MixerModel: ObservableObject {
     @Published private(set) var apps: [AudioApp] = []
+    @Published private(set) var outputDeviceName = AudioProcessMonitor.defaultOutputName()
     @Published private(set) var lastUpdated = Date()
     @Published private(set) var volumes: [String: Double] = [:]
     @Published var errorMessage: String?
@@ -372,6 +396,7 @@ final class MixerModel: ObservableObject {
 
     func refresh() {
         let nextApps = AudioProcessMonitor.activeOutputApps()
+        outputDeviceName = AudioProcessMonitor.defaultOutputName()
         let liveIDs = Set(nextApps.map(\.id))
         for oldID in Array(taps.keys) where !liveIDs.contains(oldID) {
             taps.removeValue(forKey: oldID)?.stop()
@@ -422,28 +447,28 @@ final class MixerModel: ObservableObject {
 struct MixerPopover: View {
     @EnvironmentObject private var model: MixerModel
 
-    private func volumeLabel(for app: AudioApp) -> String {
-        let volume = model.volumes[app.id] ?? 1
-        let percentage = Int(volume * 100)
-        return "\(percentage)%"
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(model.outputDeviceName)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.primary.opacity(0.88))
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+
             if model.apps.isEmpty {
-                Image(systemName: "speaker.wave.2")
+                Image(systemName: "speaker.wave.2.fill")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 44)
             } else {
-                VStack(spacing: 4) {
+                VStack(spacing: 9) {
                     ForEach(model.apps) { app in
-                        VStack(spacing: 2) {
+                        VStack(spacing: 7) {
                             HStack(spacing: 9) {
                                 Button { model.toggleMute(for: app) } label: {
                                     Image(nsImage: app.icon)
                                         .resizable()
                                         .aspectRatio(contentMode: .fit)
-                                        .frame(width: 23, height: 23)
+                                        .frame(width: 21, height: 21)
                                         .overlay(alignment: .bottomTrailing) {
                                             if model.volumes[app.id, default: 1] == 0 {
                                                 Image(systemName: "speaker.slash.fill")
@@ -460,40 +485,54 @@ struct MixerPopover: View {
                                     .font(.system(size: 13, weight: .medium))
                                     .lineLimit(1)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-
-                                Text(volumeLabel(for: app))
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 34, alignment: .trailing)
                             }
 
-                            Slider(
-                                value: Binding(
-                                    get: { model.volumes[app.id, default: 1] },
-                                    set: { model.setVolume($0, for: app) }
-                                ),
-                                in: 0...1
-                            )
-                            .tint(.primary.opacity(0.85))
+                            HStack(spacing: 9) {
+                                Image(systemName: "speaker.fill")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.secondary)
+
+                                Slider(
+                                    value: Binding(
+                                        get: { model.volumes[app.id, default: 1] },
+                                        set: { model.setVolume($0, for: app) }
+                                    ),
+                                    in: 0...1
+                                )
+                                .tint(.primary.opacity(0.9))
+
+                                Image(systemName: "speaker.wave.2.fill")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                                .strokeBorder(.white.opacity(0.13), lineWidth: 0.7)
+                        .padding(.horizontal, 9)
+
+                        if app.id != model.apps.last?.id {
+                            Rectangle()
+                                .fill(.white.opacity(0.14))
+                                .frame(height: 0.7)
+                                .padding(.horizontal, 8)
                         }
                     }
                 }
             }
         }
-        .padding(10)
-        .frame(width: 315)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(17)
+        .frame(width: 370)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 32, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
+            RoundedRectangle(cornerRadius: 32, style: .continuous)
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [.white.opacity(0.55), .white.opacity(0.12), .white.opacity(0.35)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
         }
+        .shadow(color: .black.opacity(0.28), radius: 24, x: 0, y: 12)
         .alert("Couldn't adjust volume", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
