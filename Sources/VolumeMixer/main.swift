@@ -1,8 +1,8 @@
 import AppKit
 import AudioToolbox
-import AVFoundation
 import Combine
 import CoreAudio
+import os
 import SwiftUI
 
 struct AudioApp: Identifiable, Equatable {
@@ -125,19 +125,35 @@ enum AudioProcessMonitor {
     }
 }
 
-/// Captures one app through a Core Audio process tap, changes its gain, and
-/// sends the processed audio through the engine's normal Mac output device.
-final class AppVolumeTap {
+/// Holds a lock-free gain value read from Core Audio's real-time I/O callback.
+final class GainStorage: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock(initialState: Float(1))
+
+    var value: Float {
+        get { lock.withLock { $0 } }
+        set { lock.withLock { $0 = newValue } }
+    }
+}
+
+/// Captures a process with a tap, then applies gain directly in the aggregate
+/// device's Core Audio callback before sending samples to the physical output.
+final class AppVolumeTap: @unchecked Sendable {
     private var tapID: AudioObjectID = kAudioObjectUnknown
     private var aggregateDeviceID: AudioObjectID = kAudioObjectUnknown
-    private let engine = AVAudioEngine()
+    private var ioProcID: AudioDeviceIOProcID?
+    private var isStarted = false
+    private let gainStorage = GainStorage()
 
     init(processObjectIDs: [AudioObjectID], gain: Float) throws {
-        var tapID = AudioObjectID(kAudioObjectUnknown)
+        gainStorage.value = min(max(gain, 0), 1)
+
+        let outputUID = try Self.defaultOutputDeviceUID()
         let tapDescription = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
         tapDescription.name = "Mactotalvolume app mixer"
         tapDescription.muteBehavior = CATapMuteBehavior.mutedWhenTapped
+        tapDescription.deviceUID = outputUID
 
+        var tapID = AudioObjectID(kAudioObjectUnknown)
         let tapStatus = AudioHardwareCreateProcessTap(tapDescription, &tapID)
         guard tapStatus == noErr else { throw MixerError.coreAudio(tapStatus) }
         self.tapID = tapID
@@ -149,11 +165,17 @@ final class AppVolumeTap {
                 kAudioSubTapUIDKey as String: tapUID,
                 kAudioSubTapDriftCompensationKey as String: true
             ]
+            let outputEntry: [String: Any] = [
+                kAudioSubDeviceUIDKey as String: outputUID,
+                kAudioSubDeviceDriftCompensationKey as String: false
+            ]
             let aggregateDescription: [String: Any] = [
                 kAudioAggregateDeviceNameKey as String: "Mactotalvolume private audio route",
                 kAudioAggregateDeviceUIDKey as String: aggregateUID,
                 kAudioAggregateDeviceIsPrivateKey as String: true,
                 kAudioAggregateDeviceIsStackedKey as String: false,
+                kAudioAggregateDeviceSubDeviceListKey as String: [outputEntry],
+                kAudioAggregateDeviceMainSubDeviceKey as String: outputUID,
                 kAudioAggregateDeviceTapListKey as String: [tapEntry],
                 kAudioAggregateDeviceTapAutoStartKey as String: true
             ]
@@ -165,20 +187,21 @@ final class AppVolumeTap {
             guard aggregateStatus == noErr else { throw MixerError.coreAudio(aggregateStatus) }
             aggregateDeviceID = aggregateID
 
-            try Self.selectDevice(aggregateID, for: engine.inputNode.audioUnit,
-                                  message: "macOS did not provide an audio input unit.")
-
-            let input = engine.inputNode
-            let inputFormat = input.outputFormat(forBus: 0)
-            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-                throw MixerError.message(
-                    "The audio tap has no active input format. Start app audio and try again."
-                )
+            let gainStorage = self.gainStorage
+            var procID: AudioDeviceIOProcID?
+            let procStatus = AudioDeviceCreateIOProcIDWithBlock(
+                &procID, aggregateID, nil
+            ) { _, inputData, _, outputData, _ in
+                Self.copyAudio(inputData, to: outputData, gain: gainStorage.value)
             }
-            engine.connect(input, to: engine.mainMixerNode, format: inputFormat)
-            engine.mainMixerNode.outputVolume = min(max(gain, 0), 1)
-            engine.prepare()
-            try engine.start()
+            guard procStatus == noErr, let procID else {
+                throw MixerError.coreAudio(procStatus)
+            }
+            ioProcID = procID
+
+            let startStatus = AudioDeviceStart(aggregateID, procID)
+            guard startStatus == noErr else { throw MixerError.coreAudio(startStatus) }
+            isStarted = true
         } catch {
             stop()
             throw error
@@ -186,11 +209,18 @@ final class AppVolumeTap {
     }
 
     func setGain(_ gain: Float) {
-        engine.mainMixerNode.outputVolume = min(max(gain, 0), 1)
+        gainStorage.value = min(max(gain, 0), 1)
     }
 
     func stop() {
-        engine.stop()
+        if isStarted, aggregateDeviceID != kAudioObjectUnknown, let ioProcID {
+            AudioDeviceStop(aggregateDeviceID, ioProcID)
+            isStarted = false
+        }
+        if aggregateDeviceID != kAudioObjectUnknown, let ioProcID {
+            AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
+            self.ioProcID = nil
+        }
         if aggregateDeviceID != kAudioObjectUnknown {
             AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
             aggregateDeviceID = kAudioObjectUnknown
@@ -198,6 +228,62 @@ final class AppVolumeTap {
         if tapID != kAudioObjectUnknown {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = kAudioObjectUnknown
+        }
+    }
+
+    private static func copyAudio(
+        _ inputData: UnsafePointer<AudioBufferList>,
+        to outputData: UnsafeMutablePointer<AudioBufferList>,
+        gain: Float
+    ) {
+        let inputBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+        let outputBuffers = UnsafeMutableAudioBufferListPointer(outputData)
+        guard !outputBuffers.isEmpty else { return }
+
+        guard !inputBuffers.isEmpty else {
+            for output in outputBuffers {
+                if let data = output.mData {
+                    memset(data, 0, Int(output.mDataByteSize))
+                }
+            }
+            return
+        }
+
+        let channelOffsets = inputBuffers.reduce(into: [UInt32]()) { offsets, buffer in
+            offsets.append((offsets.last ?? 0) + buffer.mNumberChannels)
+        }
+        let totalInputChannels = channelOffsets.last ?? 0
+        guard totalInputChannels > 0 else { return }
+
+        for (outputIndex, output) in outputBuffers.enumerated() {
+            guard let outputData = output.mData else { continue }
+            let outputChannels = max(output.mNumberChannels, 1)
+            let outputFrames = Int(output.mDataByteSize) / MemoryLayout<Float>.size / Int(outputChannels)
+
+            for localChannel in 0..<Int(outputChannels) {
+                let globalChannel = (outputBuffers[..<outputIndex].reduce(0) { $0 + Int($1.mNumberChannels) } + localChannel) % Int(totalInputChannels)
+                guard let inputIndex = channelOffsets.firstIndex(where: { Int($0) > globalChannel }) else { continue }
+                let firstChannel = inputIndex == 0 ? 0 : Int(channelOffsets[inputIndex - 1])
+                let input = inputBuffers[inputIndex]
+                guard let inputData = input.mData else { continue }
+                let inputChannels = max(input.mNumberChannels, 1)
+                let channelInBuffer = globalChannel - firstChannel
+                let inputFrames = Int(input.mDataByteSize) / MemoryLayout<Float>.size / Int(inputChannels)
+                let frames = min(outputFrames, inputFrames)
+                let source = inputData.assumingMemoryBound(to: Float.self)
+                let destination = outputData.assumingMemoryBound(to: Float.self)
+
+                for frame in 0..<frames {
+                    let sourceIndex = frame * Int(inputChannels) + channelInBuffer
+                    let destinationIndex = frame * Int(outputChannels) + localChannel
+                    destination[destinationIndex] = source[sourceIndex] * gain
+                }
+                if frames < outputFrames {
+                    for frame in frames..<outputFrames {
+                        destination[frame * Int(outputChannels) + localChannel] = 0
+                    }
+                }
+            }
         }
     }
 
@@ -214,22 +300,27 @@ final class AppVolumeTap {
         return uid as String
     }
 
-    private static func selectDevice(
-        _ deviceID: AudioObjectID,
-        for audioUnit: AudioUnit?,
-        message: String
-    ) throws {
-        guard let audioUnit else { throw MixerError.message(message) }
-        var selectedDevice = deviceID
-        let status = AudioUnitSetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &selectedDevice,
-            UInt32(MemoryLayout<AudioObjectID>.size)
+    private static func defaultOutputDeviceUID() throws -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
         )
-        guard status == noErr else { throw MixerError.coreAudio(status) }
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+        )
+        guard status == noErr, deviceID != kAudioObjectUnknown else {
+            throw MixerError.coreAudio(status)
+        }
+
+        address.mSelector = kAudioDevicePropertyDeviceUID
+        var uid: CFString = "" as CFString
+        size = UInt32(MemoryLayout<CFString>.stride)
+        let uidStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &uid)
+        guard uidStatus == noErr else { throw MixerError.coreAudio(uidStatus) }
+        return uid as String
     }
 }
 
