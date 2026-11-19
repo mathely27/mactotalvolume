@@ -8,12 +8,17 @@ import SwiftUI
 struct AudioApp: Identifiable, Equatable {
     let id: String
     let name: String
+    let icon: NSImage
     let processObjectIDs: [AudioObjectID]
+
+    static func == (lhs: AudioApp, rhs: AudioApp) -> Bool {
+        lhs.id == rhs.id && lhs.processObjectIDs == rhs.processObjectIDs
+    }
 }
 
 /// Reads the Core Audio process list and maps audio process IDs to app names.
-/// Chromium and other apps may expose helper processes; those are shown by PID
-/// until we add app/helper grouping in the mixer engine.
+/// Chromium and other apps may expose helper processes; keeping them separate
+/// lets each active audio process receive its own tap and control.
 enum AudioProcessMonitor {
     static func activeOutputApps() -> [AudioApp] {
         var address = AudioObjectPropertyAddress(
@@ -47,7 +52,7 @@ enum AudioProcessMonitor {
             runningApps.compactMap { app in app.bundleIdentifier.map { ($0, app) } },
             uniquingKeysWith: { first, _ in first }
         )
-        var processes: [(id: String, name: String, objectID: AudioObjectID)] = []
+        var processes: [(id: String, name: String, objectID: AudioObjectID, app: NSRunningApplication?)] = []
 
         for processObjectID in processIDs {
             guard let isRunningOutput = readUInt32(
@@ -60,14 +65,15 @@ enum AudioProcessMonitor {
             let processBundleID = readBundleID(processObjectID)
             let app = appsByPID[pid] ?? processBundleID.flatMap { appsByBundleID[$0] }
             let bundleID = app?.bundleIdentifier ?? processBundleID
-            let id = bundleID ?? "pid:\(pid)"
+            let id = "pid:\(pid)"
             let name = app?.localizedName ?? bundleID ?? "Audio process (PID \(pid))"
-            processes.append((id, name, processObjectID))
+            processes.append((id, name, processObjectID, app))
         }
 
-        let grouped = Dictionary(grouping: processes, by: \.id)
-        return grouped.map { id, group in
-            AudioApp(id: id, name: group[0].name, processObjectIDs: group.map(\.objectID))
+        return processes.map { process in
+            let icon = process.app?.icon ?? NSWorkspace.shared.icon(forFileType: "app")
+            return AudioApp(id: process.id, name: process.name, icon: icon,
+                            processObjectIDs: [process.objectID])
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
@@ -119,8 +125,8 @@ enum AudioProcessMonitor {
     }
 }
 
-/// Captures one app's output through a Core Audio process tap, applies gain,
-/// and sends it back through an aggregate device containing the current output.
+/// Captures one app through a Core Audio process tap, changes its gain, and
+/// sends the processed audio through the engine's normal Mac output device.
 final class AppVolumeTap {
     private var tapID: AudioObjectID = kAudioObjectUnknown
     private var aggregateDeviceID: AudioObjectID = kAudioObjectUnknown
@@ -138,12 +144,7 @@ final class AppVolumeTap {
 
         do {
             let tapUID = try Self.tapUID(tapID)
-            let outputUID = try Self.defaultOutputDeviceUID()
             let aggregateUID = "com.mathely.mactotalvolume.tap.\(UUID().uuidString)"
-            let outputEntry: [String: Any] = [
-                kAudioSubDeviceUIDKey as String: outputUID,
-                kAudioSubDeviceDriftCompensationKey as String: false
-            ]
             let tapEntry: [String: Any] = [
                 kAudioSubTapUIDKey as String: tapUID,
                 kAudioSubTapDriftCompensationKey as String: true
@@ -153,8 +154,6 @@ final class AppVolumeTap {
                 kAudioAggregateDeviceUIDKey as String: aggregateUID,
                 kAudioAggregateDeviceIsPrivateKey as String: true,
                 kAudioAggregateDeviceIsStackedKey as String: false,
-                kAudioAggregateDeviceSubDeviceListKey as String: [outputEntry],
-                kAudioAggregateDeviceMainSubDeviceKey as String: outputUID,
                 kAudioAggregateDeviceTapListKey as String: [tapEntry],
                 kAudioAggregateDeviceTapAutoStartKey as String: true
             ]
@@ -168,8 +167,6 @@ final class AppVolumeTap {
 
             try Self.selectDevice(aggregateID, for: engine.inputNode.audioUnit,
                                   message: "macOS did not provide an audio input unit.")
-            try Self.selectDevice(aggregateID, for: engine.outputNode.audioUnit,
-                                  message: "macOS did not provide an audio output unit.")
 
             let input = engine.inputNode
             let inputFormat = input.outputFormat(forBus: 0)
@@ -217,29 +214,6 @@ final class AppVolumeTap {
         return uid as String
     }
 
-    private static func defaultOutputDeviceUID() throws -> String {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var deviceID = AudioObjectID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
-        )
-        guard status == noErr, deviceID != kAudioObjectUnknown else {
-            throw MixerError.coreAudio(status)
-        }
-
-        address.mSelector = kAudioDevicePropertyDeviceUID
-        var uid: CFString = "" as CFString
-        size = UInt32(MemoryLayout<CFString>.stride)
-        let uidStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &uid)
-        guard uidStatus == noErr else { throw MixerError.coreAudio(uidStatus) }
-        return uid as String
-    }
-
     private static func selectDevice(
         _ deviceID: AudioObjectID,
         for audioUnit: AudioUnit?,
@@ -280,6 +254,7 @@ final class MixerModel: ObservableObject {
 
     private var timer: Timer?
     private var taps: [String: AppVolumeTap] = [:]
+    private var rememberedVolumes: [String: Double] = [:]
 
     init() {
         refresh()
@@ -291,7 +266,7 @@ final class MixerModel: ObservableObject {
     func refresh() {
         let nextApps = AudioProcessMonitor.activeOutputApps()
         let liveIDs = Set(nextApps.map(\.id))
-        for oldID in taps.keys where !liveIDs.contains(oldID) {
+        for oldID in Array(taps.keys) where !liveIDs.contains(oldID) {
             taps.removeValue(forKey: oldID)?.stop()
             volumes.removeValue(forKey: oldID)
         }
@@ -304,13 +279,6 @@ final class MixerModel: ObservableObject {
 
     func setVolume(_ volume: Double, for app: AudioApp) {
         let value = min(max(volume, 0), 1)
-        if abs(value - 1) < 0.005 {
-            taps.removeValue(forKey: app.id)?.stop()
-            volumes[app.id] = 1
-            errorMessage = nil
-            return
-        }
-
         do {
             if let tap = taps[app.id] {
                 tap.setGain(Float(value))
@@ -321,11 +289,21 @@ final class MixerModel: ObservableObject {
                 )
             }
             volumes[app.id] = value
+            if value > 0.01 { rememberedVolumes[app.id] = value }
             errorMessage = nil
         } catch {
             taps.removeValue(forKey: app.id)?.stop()
             volumes[app.id] = 1
             errorMessage = "Couldn't control this app's audio. \(error.localizedDescription)"
+        }
+    }
+
+    func toggleMute(for app: AudioApp) {
+        if volumes[app.id, default: 1] <= 0.01 {
+            setVolume(rememberedVolumes[app.id, default: 0.5], for: app)
+        } else {
+            rememberedVolumes[app.id] = volumes[app.id, default: 1]
+            setVolume(0, for: app)
         }
     }
 }
@@ -334,49 +312,38 @@ struct MixerPopover: View {
     @EnvironmentObject private var model: MixerModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Volume Mixer")
-                        .font(.headline)
-                    Text("Individual app volume controls")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(action: model.refresh) {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh audio apps")
-            }
-
-            Divider()
-
+        VStack(alignment: .leading, spacing: 8) {
             if model.apps.isEmpty {
-                ContentUnavailableView(
-                    "No active audio",
-                    systemImage: "speaker.slash",
-                    description: Text("Start playing something in an app and it will appear here.")
-                )
-                .frame(maxWidth: .infinity, minHeight: 125)
+                Image(systemName: "speaker.wave.2")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 44)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(spacing: 5) {
                         ForEach(model.apps) { app in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(spacing: 8) {
-                                    Image(systemName: model.volumes[app.id, default: 1] == 0
-                                          ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 18)
-                                    Text(app.name).lineLimit(1)
-                                    Spacer(minLength: 4)
-                                    Text("\(Int(model.volumes[app.id, default: 1] * 100))%")
-                                        .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 38, alignment: .trailing)
+                            HStack(spacing: 10) {
+                                Button { model.toggleMute(for: app) } label: {
+                                    Image(nsImage: app.icon)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(width: 22, height: 22)
+                                        .overlay(alignment: .bottomTrailing) {
+                                            if model.volumes[app.id, default: 1] <= 0.01 {
+                                                Image(systemName: "speaker.slash.fill")
+                                                    .font(.system(size: 8, weight: .bold))
+                                                    .padding(2)
+                                                    .background(.regularMaterial, in: Circle())
+                                            }
+                                        }
                                 }
+                                .buttonStyle(.plain)
+                                .help("Mute or unmute \(app.name)")
+
+                                Text(app.name)
+                                    .font(.system(size: 13))
+                                    .lineLimit(1)
+                                    .frame(width: 112, alignment: .leading)
+
                                 Slider(
                                     value: Binding(
                                         get: { model.volumes[app.id, default: 1] },
@@ -385,33 +352,25 @@ struct MixerPopover: View {
                                     in: 0...1
                                 )
                             }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                         }
                     }
                 }
-                .frame(maxHeight: 260)
-            }
-
-            if let errorMessage = model.errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Divider()
-            HStack {
-                Text("Updates automatically")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-                    .keyboardShortcut("q")
-                    .buttonStyle(.plain)
-                    .font(.caption)
+                .frame(maxHeight: 300)
             }
         }
-        .padding(14)
-        .frame(width: 320)
+        .padding(10)
+        .frame(width: 345)
+        .alert("Couldn't adjust volume", isPresented: Binding(
+            get: { model.errorMessage != nil },
+            set: { if !$0 { model.errorMessage = nil } }
+        )) {
+            Button("OK") { model.errorMessage = nil }
+        } message: {
+            Text(model.errorMessage ?? "Try again.")
+        }
     }
 }
 

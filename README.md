@@ -1,21 +1,15 @@
-# Volume Mixer for Mac
+# Mactotalvolume
 
-A small macOS menu bar app for controlling the volume of individual apps.
+A lightweight macOS menu bar app for changing the volume of individual audio processes.
 
-## Current part
+## Build and launch
 
-The menu bar popup currently detects and lists apps that are sending audio. This confirms the Core Audio process discovery step. Per-app sliders are the next part: macOS routes those through Core Audio process taps, which require macOS 14.2 or later and the system's audio-capture permission.
-
-## Run it
-
-From this folder in Terminal:
+Run this from the project folder in Antigravity's terminal:
 
 ```sh
-swift run
+./scripts/build-app.sh
 ```
 
-The app appears as a speaker icon in the menu bar. Play audio in an app and open the icon to see it listed.
+The script closes an older `VolumeMixer` process, replaces the app bundle under `.build`, and launches one fresh copy. The app uses Core Audio process taps (macOS 14.2+) and asks macOS for System Audio Recording permission when first used.
 
-## Build a distributable app
-
-This project currently runs from Swift Package Manager. We can add an `.app` bundle and signing setup after the volume engine works.
+Each active Core Audio process gets its own icon and slider. Browsers may use separate helper processes for audio, but macOS does not expose browser tab titles through Core Audio, and a helper process can serve more than one tab.
