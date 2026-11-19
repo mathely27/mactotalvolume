@@ -2,6 +2,18 @@
 
 A lightweight macOS menu bar app for changing the volume of individual audio processes.
 
+## Download and install
+
+[Download the universal DMG](dist/Mactotalvolume-0.1.0-universal.dmg) for Apple silicon and Intel Macs running macOS 14.2 or later.
+
+Open the DMG, drag `Mactotalvolume.app` onto the `Applications` shortcut, then open it from Applications. If macOS blocks the first launch, check **System Settings → Privacy & Security** for an **Open Anyway** option. When macOS asks for System Audio Recording access, allow it so the app can control audio.
+
+The app is ad-hoc signed and not notarized, so Gatekeeper may show a first-open warning. To rebuild the DMG from source, run:
+
+```sh
+./scripts/package-dmg.sh
+```
+
 ## Build and launch
 
 Run this from the project folder in Antigravity's terminal:
