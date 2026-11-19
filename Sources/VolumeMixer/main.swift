@@ -20,6 +20,8 @@ struct AudioApp: Identifiable, Equatable {
 /// Chromium and other apps may expose helper processes; keeping them separate
 /// lets each active audio process receive its own tap and control.
 enum AudioProcessMonitor {
+    private static let mixerBundleID = "com.mathely.mactotalvolume"
+
     static func activeOutputApps() -> [AudioApp] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyProcessObjectList,
@@ -63,8 +65,22 @@ enum AudioProcessMonitor {
             }
 
             let processBundleID = readBundleID(processObjectID)
-            let app = appsByPID[pid] ?? processBundleID.flatMap { appsByBundleID[$0] }
+            let processApp = appsByPID[pid] ?? processBundleID.flatMap { appsByBundleID[$0] }
+            // Helper processes (Chromium renderers, media helpers, etc.) should
+            // use their parent app's name and icon while keeping a separate PID
+            // so each independently audible process still gets its own slider.
+            let parentApp = processBundleID.flatMap { bundleID in
+                runningApps
+                    .filter { app in
+                        guard let parentID = app.bundleIdentifier else { return false }
+                        return !parentID.localizedCaseInsensitiveContains(".helper")
+                            && bundleID.hasPrefix(parentID + ".")
+                    }
+                    .max { ($0.bundleIdentifier?.count ?? 0) < ($1.bundleIdentifier?.count ?? 0) }
+            }
+            let app = parentApp ?? processApp
             let bundleID = app?.bundleIdentifier ?? processBundleID
+            guard bundleID != mixerBundleID else { continue }
             let id = "pid:\(pid)"
             let name = app?.localizedName ?? bundleID ?? "Audio process (PID \(pid))"
             processes.append((id, name, processObjectID, app))
@@ -370,27 +386,31 @@ final class MixerModel: ObservableObject {
 
     func setVolume(_ volume: Double, for app: AudioApp) {
         let value = min(max(volume, 0), 1)
+        // Keep the audio callback alive at the slider's zero position. A true
+        // stream of all-zero samples can make some browser audio clients stall;
+        // -80 dB is effectively silent, but can be raised immediately again.
+        let callbackGain = value == 0 ? 0.0001 : Float(value)
         do {
             if let tap = taps[app.id] {
-                tap.setGain(Float(value))
+                tap.setGain(callbackGain)
             } else {
                 taps[app.id] = try AppVolumeTap(
                     processObjectIDs: app.processObjectIDs,
-                    gain: Float(value)
+                    gain: callbackGain
                 )
             }
             volumes[app.id] = value
-            if value > 0.01 { rememberedVolumes[app.id] = value }
+            if value > 0 { rememberedVolumes[app.id] = value }
             errorMessage = nil
         } catch {
             taps.removeValue(forKey: app.id)?.stop()
-            volumes[app.id] = 1
+            volumes[app.id] = volumes[app.id] ?? 1
             errorMessage = "Couldn't control this app's audio. \(error.localizedDescription)"
         }
     }
 
     func toggleMute(for app: AudioApp) {
-        if volumes[app.id, default: 1] <= 0.01 {
+        if volumes[app.id, default: 1] == 0 {
             setVolume(rememberedVolumes[app.id, default: 0.5], for: app)
         } else {
             rememberedVolumes[app.id] = volumes[app.id, default: 1]
@@ -402,6 +422,12 @@ final class MixerModel: ObservableObject {
 struct MixerPopover: View {
     @EnvironmentObject private var model: MixerModel
 
+    private func volumeLabel(for app: AudioApp) -> String {
+        let volume = model.volumes[app.id] ?? 1
+        let percentage = Int(volume * 100)
+        return "\(percentage)%"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if model.apps.isEmpty {
@@ -412,40 +438,48 @@ struct MixerPopover: View {
                 ScrollView {
                     VStack(spacing: 5) {
                         ForEach(model.apps) { app in
-                            HStack(spacing: 10) {
-                                Button { model.toggleMute(for: app) } label: {
-                                    Image(nsImage: app.icon)
-                                        .resizable()
-                                        .aspectRatio(contentMode: .fit)
-                                        .frame(width: 22, height: 22)
-                                        .overlay(alignment: .bottomTrailing) {
-                                            if model.volumes[app.id, default: 1] <= 0.01 {
-                                                Image(systemName: "speaker.slash.fill")
-                                                    .font(.system(size: 8, weight: .bold))
-                                                    .padding(2)
-                                                    .background(.regularMaterial, in: Circle())
-                                            }
+                                VStack(spacing: 6) {
+                                    HStack(spacing: 10) {
+                                        Button { model.toggleMute(for: app) } label: {
+                                            Image(nsImage: app.icon)
+                                                .resizable()
+                                                .aspectRatio(contentMode: .fit)
+                                                .frame(width: 25, height: 25)
+                                                .overlay(alignment: .bottomTrailing) {
+                                                    if model.volumes[app.id, default: 1] == 0 {
+                                                        Image(systemName: "speaker.slash.fill")
+                                                            .font(.system(size: 8, weight: .bold))
+                                                            .padding(2)
+                                                            .background(.regularMaterial, in: Circle())
+                                                    }
+                                                }
                                         }
+                                        .buttonStyle(.plain)
+                                        .help("Mute or unmute \(app.name)")
+
+                                        Text(app.name)
+                                            .font(.system(size: 13, weight: .medium))
+                                            .lineLimit(1)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                                        Text(volumeLabel(for: app))
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 34, alignment: .trailing)
+                                    }
+
+                                    Slider(
+                                        value: Binding(
+                                            get: { model.volumes[app.id, default: 1] },
+                                            set: { model.setVolume($0, for: app) }
+                                        ),
+                                        in: 0...1
+                                    )
+                                    .tint(.primary.opacity(0.8))
                                 }
-                                .buttonStyle(.plain)
-                                .help("Mute or unmute \(app.name)")
-
-                                Text(app.name)
-                                    .font(.system(size: 13))
-                                    .lineLimit(1)
-                                    .frame(width: 112, alignment: .leading)
-
-                                Slider(
-                                    value: Binding(
-                                        get: { model.volumes[app.id, default: 1] },
-                                        set: { model.setVolume($0, for: app) }
-                                    ),
-                                    in: 0...1
-                                )
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 8)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                         }
                     }
                 }
@@ -453,7 +487,7 @@ struct MixerPopover: View {
             }
         }
         .padding(10)
-        .frame(width: 345)
+        .frame(width: 310)
         .alert("Couldn't adjust volume", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
